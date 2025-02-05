@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use Illuminate\Http\Request;
 use PhpOffice\PhpSpreadsheet\IOFactory;
 use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+use PhpOffice\PhpSpreadsheet\Worksheet\Worksheet;
 
 class ExcelController extends Controller
 {
@@ -37,7 +38,6 @@ class ExcelController extends Controller
             $headers1 = $this->getColumnHeaders($worksheet1);
             $headers2 = $this->getColumnHeaders($worksheet2);
 
-            // Log the headers we found
             \Log::info('File 1 Headers:', $headers1);
             \Log::info('File 2 Headers:', $headers2);
 
@@ -48,7 +48,7 @@ class ExcelController extends Controller
                 return back()->with('error', $columns['message']);
             }
 
-            // Create lookup array from second file
+            // Create data mapping from second file
             $lookupData = [];
             $highestRow2 = $worksheet2->getHighestRow();
             
@@ -56,31 +56,40 @@ class ExcelController extends Controller
                 $name = $this->cleanValue($worksheet2->getCell($columns['name2'] . $row)->getValue());
                 $ic = $this->cleanValue($worksheet2->getCell($columns['ic2'] . $row)->getValue());
                 
+                // Get position data if the column exists
+                $position = $columns['position2'] ? 
+                    $worksheet2->getCell($columns['position2'] . $row)->getValue() : 
+                    '';
+                
                 if ($name && $ic) {
-                    $lookupData[$name] = $ic;
-                    \Log::info("Found mapping: $name -> $ic");
+                    $lookupData[$name] = [
+                        'ic' => $ic,
+                        'position' => $position
+                    ];
+                    \Log::info("Found mapping: $name -> $ic (Position: $position)");
                 }
             }
 
-            // Update first file
-            $updatedCount = 0;
-            $highestRow1 = $worksheet1->getHighestRow();
-            
-            for ($row = 2; $row <= $highestRow1; $row++) {
-                $name = $this->cleanValue($worksheet1->getCell($columns['name1'] . $row)->getValue());
-                if (isset($lookupData[$name])) {
-                    $worksheet1->setCellValue($columns['ic1'] . $row, $lookupData[$name]);
-                    $updatedCount++;
-                }
-            }
+            // Process the first worksheet
+            $stats = $this->processWorksheet($worksheet1, $lookupData, $columns);
+
+            // Add new records from second file that don't exist in first file
+            $stats['added'] = $this->addNewRecords($worksheet1, $lookupData, $columns, $stats['existingNames']);
 
             $writer = new Xlsx($spreadsheet1);
             $fileName = 'updated_excel_' . time() . '.xlsx';
             $savePath = storage_path('app/public/' . $fileName);
             $writer->save($savePath);
 
+            $message = sprintf(
+                "Updated %d records, added %d new records, removed %d records",
+                $stats['updated'],
+                $stats['added'],
+                $stats['removed']
+            );
+
             return back()->with([
-                'success' => "Updated $updatedCount records successfully",
+                'success' => $message,
                 'download_file' => $fileName
             ]);
 
@@ -89,6 +98,73 @@ class ExcelController extends Controller
             \Log::error($e->getTraceAsString());
             return back()->with('error', 'Error processing files: ' . $e->getMessage());
         }
+    }
+
+    private function processWorksheet($worksheet, $lookupData, $columns)
+    {
+        $stats = [
+            'updated' => 0,
+            'removed' => 0,
+            'existingNames' => []
+        ];
+
+        $highestRow = $worksheet->getHighestRow();
+        $rowsToDelete = [];
+        
+        // First pass: identify rows to keep or delete and update IC numbers
+        for ($row = 2; $row <= $highestRow; $row++) {
+            $name = $this->cleanValue($worksheet->getCell($columns['name1'] . $row)->getValue());
+            
+            if (isset($lookupData[$name])) {
+                // Update IC number
+                $worksheet->setCellValue($columns['ic1'] . $row, $lookupData[$name]['ic']);
+                
+                // Update designation/position if column exists
+                if ($columns['designation1']) {
+                    $worksheet->setCellValue($columns['designation1'] . $row, $lookupData[$name]['position']);
+                }
+                
+                $stats['updated']++;
+                $stats['existingNames'][] = $name;
+            } else {
+                // Mark row for deletion if name doesn't exist in second file
+                $rowsToDelete[] = $row;
+            }
+        }
+
+        // Second pass: delete rows (in reverse order to maintain row indices)
+        rsort($rowsToDelete);
+        foreach ($rowsToDelete as $row) {
+            $worksheet->removeRow($row, 1);
+            $stats['removed']++;
+        }
+
+        return $stats;
+    }
+
+    private function addNewRecords($worksheet, $lookupData, $columns, $existingNames)
+    {
+        $addedCount = 0;
+        $nextRow = $worksheet->getHighestRow() + 1;
+
+        foreach ($lookupData as $name => $data) {
+            if (!in_array($name, $existingNames)) {
+                // Add new row with name, IC, and position
+                $worksheet->setCellValue($columns['name1'] . $nextRow, $name);
+                $worksheet->setCellValue($columns['ic1'] . $nextRow, $data['ic']);
+                
+                // Add position if designation column exists
+                if ($columns['designation1']) {
+                    $worksheet->setCellValue($columns['designation1'] . $nextRow, $data['position']);
+                }
+                
+                $nextRow++;
+                $addedCount++;
+                \Log::info("Added new record: $name -> {$data['ic']} (Position: {$data['position']})");
+            }
+        }
+
+        return $addedCount;
     }
 
     private function getColumnHeaders($worksheet)
@@ -114,8 +190,10 @@ class ExcelController extends Controller
         $result = [
             'name1' => null,
             'ic1' => null,
+            'designation1' => null,
             'name2' => null,
             'ic2' => null,
+            'position2' => null,
             'error' => false,
             'message' => ''
         ];
@@ -123,8 +201,10 @@ class ExcelController extends Controller
         // Array of possible header variations
         $nameVariations = ['name', 'nama', 'full name', 'employee name'];
         $icVariations = ['i.c. no.', 'ic no', 'ic number', 'ic', 'i.c no', 'i.c. number'];
+        $positionVariations = ['position', 'designation', 'job title', 'role', 'jawatan'];
 
         // Find columns in first worksheet
+        $highestColumn1 = $worksheet1->getHighestColumn();
         foreach ($this->getColumnHeaders($worksheet1) as $col => $header) {
             $cleanedHeader = $this->cleanValue($header['raw_value']);
             if (in_array($cleanedHeader, $nameVariations)) {
@@ -132,6 +212,9 @@ class ExcelController extends Controller
             }
             if (in_array($cleanedHeader, $icVariations)) {
                 $result['ic1'] = $col;
+            }
+            if (in_array($cleanedHeader, $positionVariations)) {
+                $result['designation1'] = $col;
             }
         }
 
@@ -143,6 +226,9 @@ class ExcelController extends Controller
             }
             if (in_array($cleanedHeader, $icVariations)) {
                 $result['ic2'] = $col;
+            }
+            if (in_array($cleanedHeader, $positionVariations)) {
+                $result['position2'] = $col;
             }
         }
 
@@ -158,6 +244,18 @@ class ExcelController extends Controller
         if (!$result['ic1']) {
             // If IC column doesn't exist in first file, create it
             $result['ic1'] = ++$result['name1'];
+        }
+
+        if (!$result['designation1']) {
+            // If designation column doesn't exist in first file, create it after IC
+            $newCol = $result['ic1'];
+            while ($newCol <= $highestColumn1) {
+                $newCol++;
+            }
+            $result['designation1'] = $newCol;
+            
+            // Add the header
+            $worksheet1->setCellValue($newCol . '1', 'Designation');
         }
 
         return $result;
